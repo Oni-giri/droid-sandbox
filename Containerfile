@@ -42,9 +42,10 @@ ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=1000
 
-RUN groupadd --gid $USER_GID $USERNAME 2>/dev/null || true \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME 2>/dev/null \
-    || useradd -m $USERNAME \
+# Remove ubuntu user (UID 1000) if it exists, then create dev user with UID 1000
+RUN if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || true; fi \
+    && groupadd --gid $USER_GID $USERNAME 2>/dev/null || true \
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
     && mkdir -p /home/$USERNAME/.local/bin \
     && chown -R $USERNAME:$USERNAME /home/$USERNAME
 

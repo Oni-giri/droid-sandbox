@@ -71,18 +71,22 @@ check_image() {
 
 get_base_podman_args() {
     local project="$1"
-    local args=""
+    local args=()
     
     # Mount API key if exists
     if [ -f "$API_KEY_FILE" ]; then
-        args="$args -v $API_KEY_FILE:/home/dev/.dsb-api-key:ro,Z"
-        args="$args -e FACTORY_API_KEY=\$(cat /home/dev/.dsb-api-key 2>/dev/null || echo '')"
+        args+=("-v" "$API_KEY_FILE:/home/dev/.dsb-api-key:ro,z")
+        # Set env var from file content
+        local api_key=$(cat "$API_KEY_FILE" 2>/dev/null || echo '')
+        if [ -n "$api_key" ]; then
+            args+=("-e" "FACTORY_API_KEY=$api_key")
+        fi
     fi
     
-    # Mount project workspace
-    args="$args -v $PROJECTS_DIR/$project:/home/dev/workspace:Z"
+    # Mount project workspace (use lowercase :z for shared SELinux label)
+    args+=("-v" "$PROJECTS_DIR/$project:/home/dev/workspace:z")
     
-    echo "$args"
+    echo "${args[@]}"
 }
 
 # Commands
@@ -127,10 +131,39 @@ cmd_setup() {
     mkdir -p "$PROJECTS_DIR"
     success "Projects directory created: $PROJECTS_DIR"
     
+    # Add to PATH if not already there
+    local dsb_path="$SCRIPT_DIR"
+    local shell_rc=""
+    
+    if [ -n "$BASH_VERSION" ]; then
+        shell_rc="$HOME/.bashrc"
+    elif [ -n "$ZSH_VERSION" ]; then
+        shell_rc="$HOME/.zshrc"
+    fi
+    
+    if [ -n "$shell_rc" ] && [ -f "$shell_rc" ]; then
+        if ! grep -q "risky-projects" "$shell_rc" 2>/dev/null; then
+            echo "" >> "$shell_rc"
+            echo "# droid-sandbox CLI" >> "$shell_rc"
+            echo "export PATH=\"$dsb_path:\$PATH\"" >> "$shell_rc"
+            success "Added dsb to PATH in $shell_rc"
+            info "Run: source $shell_rc (or restart terminal)"
+        else
+            info "dsb already in PATH"
+        fi
+    fi
+    
     echo
-    success "Setup complete! Get started with:"
+    success "Setup complete!"
+    echo
+    echo -e "${YELLOW}To use 'dsb' command anywhere, run:${NC}"
+    echo -e "  ${GREEN}source $shell_rc${NC}"
+    echo
+    echo "Then get started with:"
     echo "  dsb init my-project"
     echo "  dsb shell my-project"
+    echo
+    echo -e "${BLUE}(Or use './dsb' from this directory without sourcing)${NC}"
 }
 
 cmd_init() {
@@ -233,12 +266,14 @@ cmd_shell() {
     check_image
     
     local container_name=$(get_container_name "$project")
-    local base_args=$(get_base_podman_args "$project")
+    local base_args=($(get_base_podman_args "$project"))
     
     info "Opening shell in $project..."
     exec podman run -it --rm \
         --name "$container_name" \
-        $base_args \
+        --hostname "$project" \
+        --userns=keep-id \
+        "${base_args[@]}" \
         "$IMAGE_NAME" \
         bash
 }
@@ -253,11 +288,13 @@ cmd_run() {
     check_image
     
     local container_name=$(get_container_name "$project")
-    local base_args=$(get_base_podman_args "$project")
+    local base_args=($(get_base_podman_args "$project"))
     
     exec podman run -it --rm \
         --name "$container_name" \
-        $base_args \
+        --hostname "$project" \
+        --userns=keep-id \
+        "${base_args[@]}" \
         "$IMAGE_NAME" \
         "$@"
 }
@@ -280,12 +317,20 @@ cmd_start() {
         error "Container for '$project' is already running. Use 'dsb attach $project' to connect."
     fi
     
-    local base_args=$(get_base_podman_args "$project")
+    # Check if container exists but is stopped - remove it
+    if podman ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        info "Removing stopped container..."
+        podman rm "$container_name" >/dev/null 2>&1
+    fi
+    
+    local base_args=($(get_base_podman_args "$project"))
     
     info "Starting container for $project in background..."
     podman run -dt \
         --name "$container_name" \
-        $base_args \
+        --hostname "$project" \
+        --userns=keep-id \
+        "${base_args[@]}" \
         "$IMAGE_NAME" \
         $cmd
     
@@ -300,14 +345,21 @@ cmd_stop() {
     check_podman
     local container_name=$(get_container_name "$project")
     
-    if ! podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
-        error "No running container found for '$project'"
+    # Check if container exists at all
+    if ! podman ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "No container found for '$project'"
     fi
     
-    info "Stopping container for $project..."
-    podman stop "$container_name"
+    # Check if it's running
+    if podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        info "Stopping container for $project..."
+        podman stop "$container_name"
+    else
+        info "Container already stopped"
+    fi
+    
     podman rm "$container_name"
-    success "Container stopped"
+    success "Container stopped and removed"
 }
 
 cmd_attach() {
