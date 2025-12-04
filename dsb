@@ -1,0 +1,527 @@
+#!/bin/bash
+# dsb - Droid Sandbox CLI
+# Isolated containers for running AI agents on sensitive code
+
+set -e
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECTS_DIR="$SCRIPT_DIR/projects"
+CONFIG_DIR="$HOME/.config/dsb"
+API_KEY_FILE="$CONFIG_DIR/api-key"
+IMAGE_NAME="dsb-droid"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+error() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 1
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+warning() {
+    echo -e "${YELLOW}Warning:${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}→${NC} $1"
+}
+
+check_podman() {
+    if ! command -v podman &> /dev/null; then
+        error "podman not found. Install it first:
+  Ubuntu/Debian: sudo apt install podman
+  Fedora: sudo dnf install podman
+  Arch: sudo pacman -S podman"
+    fi
+}
+
+check_project_exists() {
+    local project="$1"
+    if [ ! -d "$PROJECTS_DIR/$project" ]; then
+        error "Project '$project' not found. Create it with: dsb init $project"
+    fi
+}
+
+get_container_name() {
+    echo "dsb-$1"
+}
+
+build_image() {
+    info "Building $IMAGE_NAME image..."
+    podman build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR"
+    success "Image built successfully"
+}
+
+check_image() {
+    if ! podman image exists "$IMAGE_NAME"; then
+        info "Image not found, building..."
+        build_image
+    fi
+}
+
+get_base_podman_args() {
+    local project="$1"
+    local args=""
+    
+    # Mount API key if exists
+    if [ -f "$API_KEY_FILE" ]; then
+        args="$args -v $API_KEY_FILE:/home/dev/.dsb-api-key:ro,Z"
+        args="$args -e FACTORY_API_KEY=\$(cat /home/dev/.dsb-api-key 2>/dev/null || echo '')"
+    fi
+    
+    # Mount project workspace
+    args="$args -v $PROJECTS_DIR/$project:/home/dev/workspace:Z"
+    
+    echo "$args"
+}
+
+# Commands
+
+cmd_setup() {
+    info "Setting up droid-sandbox..."
+    
+    # Check podman
+    check_podman
+    
+    # Create config directory
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    success "Config directory created: $CONFIG_DIR"
+    
+    # Setup API key
+    if [ -f "$API_KEY_FILE" ]; then
+        warning "API key already exists at $API_KEY_FILE"
+        read -p "Replace it? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Keeping existing API key"
+        else
+            read -sp "Enter Factory API key: " api_key
+            echo
+            echo "$api_key" > "$API_KEY_FILE"
+            chmod 600 "$API_KEY_FILE"
+            success "API key saved"
+        fi
+    else
+        read -sp "Enter Factory API key: " api_key
+        echo
+        echo "$api_key" > "$API_KEY_FILE"
+        chmod 600 "$API_KEY_FILE"
+        success "API key saved to $API_KEY_FILE"
+    fi
+    
+    # Build image
+    build_image
+    
+    # Create projects directory
+    mkdir -p "$PROJECTS_DIR"
+    success "Projects directory created: $PROJECTS_DIR"
+    
+    echo
+    success "Setup complete! Get started with:"
+    echo "  dsb init my-project"
+    echo "  dsb shell my-project"
+}
+
+cmd_init() {
+    local project="$1"
+    [ -z "$project" ] && error "Usage: dsb init <project-name>"
+    
+    local project_path="$PROJECTS_DIR/$project"
+    
+    if [ -d "$project_path" ]; then
+        error "Project '$project' already exists at $project_path"
+    fi
+    
+    mkdir -p "$project_path"
+    success "Project '$project' created at $project_path"
+    echo
+    info "Next steps:"
+    echo "  cd $project_path"
+    echo "  git clone <your-repo> ."
+    echo "  dsb shell $project"
+}
+
+cmd_list() {
+    if [ ! -d "$PROJECTS_DIR" ] || [ -z "$(ls -A "$PROJECTS_DIR" 2>/dev/null)" ]; then
+        info "No projects yet. Create one with: dsb init <name>"
+        return
+    fi
+    
+    echo "Projects:"
+    for dir in "$PROJECTS_DIR"/*; do
+        if [ -d "$dir" ]; then
+            local name=$(basename "$dir")
+            local container_name=$(get_container_name "$name")
+            
+            # Check if container is running
+            if podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+                echo -e "  ${GREEN}●${NC} $name ${BLUE}(running)${NC}"
+            else
+                echo "  ○ $name"
+            fi
+        fi
+    done
+}
+
+cmd_clone() {
+    local git_url="$1"
+    local project="${2:-}"
+    
+    [ -z "$git_url" ] && error "Usage: dsb clone <git-url> [project-name]"
+    
+    # Extract project name from git URL if not provided
+    if [ -z "$project" ]; then
+        project=$(basename "$git_url" .git)
+    fi
+    
+    local project_path="$PROJECTS_DIR/$project"
+    
+    if [ -d "$project_path" ]; then
+        error "Project '$project' already exists"
+    fi
+    
+    mkdir -p "$project_path"
+    info "Cloning into $project_path..."
+    git clone "$git_url" "$project_path"
+    success "Project '$project' created and cloned"
+}
+
+cmd_destroy() {
+    local project="$1"
+    [ -z "$project" ] && error "Usage: dsb destroy <project-name>"
+    
+    check_project_exists "$project"
+    
+    warning "This will permanently delete project '$project'"
+    read -p "Are you sure? [y/N] " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Cancelled"
+        exit 0
+    fi
+    
+    # Stop container if running
+    local container_name=$(get_container_name "$project")
+    if podman ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        info "Stopping and removing container..."
+        podman rm -f "$container_name" 2>/dev/null || true
+    fi
+    
+    # Remove project directory
+    rm -rf "$PROJECTS_DIR/$project"
+    success "Project '$project' destroyed"
+}
+
+cmd_shell() {
+    local project="$1"
+    [ -z "$project" ] && error "Usage: dsb shell <project-name>"
+    
+    check_podman
+    check_project_exists "$project"
+    check_image
+    
+    local container_name=$(get_container_name "$project")
+    local base_args=$(get_base_podman_args "$project")
+    
+    info "Opening shell in $project..."
+    exec podman run -it --rm \
+        --name "$container_name" \
+        $base_args \
+        "$IMAGE_NAME" \
+        bash
+}
+
+cmd_run() {
+    local project="$1"
+    shift
+    [ -z "$project" ] && error "Usage: dsb run <project-name> <command...>"
+    
+    check_podman
+    check_project_exists "$project"
+    check_image
+    
+    local container_name=$(get_container_name "$project")
+    local base_args=$(get_base_podman_args "$project")
+    
+    exec podman run -it --rm \
+        --name "$container_name" \
+        $base_args \
+        "$IMAGE_NAME" \
+        "$@"
+}
+
+cmd_start() {
+    local project="$1"
+    shift
+    local cmd="${*:-bash}"
+    
+    [ -z "$project" ] && error "Usage: dsb start <project-name> [command]"
+    
+    check_podman
+    check_project_exists "$project"
+    check_image
+    
+    local container_name=$(get_container_name "$project")
+    
+    # Check if already running
+    if podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "Container for '$project' is already running. Use 'dsb attach $project' to connect."
+    fi
+    
+    local base_args=$(get_base_podman_args "$project")
+    
+    info "Starting container for $project in background..."
+    podman run -dt \
+        --name "$container_name" \
+        $base_args \
+        "$IMAGE_NAME" \
+        $cmd
+    
+    success "Container started. Use 'dsb attach $project' to connect."
+    info "Detach with: Ctrl+P, Ctrl+Q"
+}
+
+cmd_stop() {
+    local project="$1"
+    [ -z "$project" ] && error "Usage: dsb stop <project-name>"
+    
+    check_podman
+    local container_name=$(get_container_name "$project")
+    
+    if ! podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "No running container found for '$project'"
+    fi
+    
+    info "Stopping container for $project..."
+    podman stop "$container_name"
+    podman rm "$container_name"
+    success "Container stopped"
+}
+
+cmd_attach() {
+    local project="$1"
+    [ -z "$project" ] && error "Usage: dsb attach <project-name>"
+    
+    check_podman
+    local container_name=$(get_container_name "$project")
+    
+    if ! podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "No running container found for '$project'. Start one with: dsb start $project"
+    fi
+    
+    info "Attaching to $project... (Detach: Ctrl+P, Ctrl+Q)"
+    exec podman attach "$container_name"
+}
+
+cmd_exec() {
+    local project="$1"
+    shift
+    [ -z "$project" ] && error "Usage: dsb exec <project-name> <command...>"
+    
+    check_podman
+    local container_name=$(get_container_name "$project")
+    
+    if ! podman ps --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "No running container found for '$project'. Start one with: dsb start $project"
+    fi
+    
+    exec podman exec -it "$container_name" "$@"
+}
+
+cmd_logs() {
+    local project="$1"
+    local follow_flag=""
+    
+    if [ "$2" = "-f" ] || [ "$2" = "--follow" ]; then
+        follow_flag="-f"
+    fi
+    
+    [ -z "$project" ] && error "Usage: dsb logs <project-name> [-f|--follow]"
+    
+    check_podman
+    local container_name=$(get_container_name "$project")
+    
+    if ! podman ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        error "No container found for '$project'"
+    fi
+    
+    exec podman logs $follow_flag "$container_name"
+}
+
+cmd_ps() {
+    check_podman
+    
+    echo "Running containers:"
+    podman ps --filter "name=^dsb-" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | sed 's/dsb-/  /'
+}
+
+cmd_status() {
+    check_podman
+    
+    echo "=== Containers ==="
+    podman ps -a --filter "name=^dsb-" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" | sed 's/dsb-/  /'
+    
+    echo
+    echo "=== Images ==="
+    podman images "$IMAGE_NAME" --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+    
+    echo
+    echo "=== Disk Usage ==="
+    podman system df
+}
+
+cmd_build() {
+    check_podman
+    
+    local force=false
+    if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
+        force=true
+    fi
+    
+    if $force; then
+        info "Force rebuilding image from scratch..."
+        podman rmi "$IMAGE_NAME" 2>/dev/null || true
+    fi
+    
+    build_image
+}
+
+cmd_clean() {
+    check_podman
+    
+    info "Removing stopped dsb containers..."
+    local count=$(podman ps -a --filter "name=^dsb-" --filter "status=exited" --format "{{.Names}}" | wc -l)
+    
+    if [ "$count" -eq 0 ]; then
+        info "No stopped containers to remove"
+    else
+        podman ps -a --filter "name=^dsb-" --filter "status=exited" --format "{{.Names}}" | xargs -r podman rm
+        success "Removed $count stopped container(s)"
+    fi
+}
+
+cmd_help() {
+    local command="$1"
+    
+    if [ -n "$command" ]; then
+        case "$command" in
+            init) echo "Usage: dsb init <project-name>
+Create a new project folder under projects/" ;;
+            clone) echo "Usage: dsb clone <git-url> [project-name]
+Clone a git repository into a new project" ;;
+            shell) echo "Usage: dsb shell <project-name>
+Open an interactive bash shell in a container for the project" ;;
+            run) echo "Usage: dsb run <project-name> <command...>
+Run a command in a new container (e.g., dsb run my-wallet droid)" ;;
+            start) echo "Usage: dsb start <project-name> [command]
+Start a container in the background (detached mode)
+Default command: bash
+Detach: Ctrl+P, Ctrl+Q" ;;
+            stop) echo "Usage: dsb stop <project-name>
+Stop and remove a running detached container" ;;
+            attach) echo "Usage: dsb attach <project-name>
+Attach to a running detached container
+Detach: Ctrl+P, Ctrl+Q" ;;
+            exec) echo "Usage: dsb exec <project-name> <command...>
+Execute a command in a running container" ;;
+            logs) echo "Usage: dsb logs <project-name> [-f|--follow]
+View logs from a container" ;;
+            *) echo "No help available for '$command'" ;;
+        esac
+        return
+    fi
+    
+    cat << 'EOF'
+dsb - Droid Sandbox CLI
+
+USAGE:
+  dsb <command> [options]
+
+PROJECT MANAGEMENT:
+  init <project>              Create new project folder
+  list                        List all projects
+  clone <git-url> [name]      Clone repo into new project
+  destroy <project>           Remove project (with confirmation)
+
+INTERACTIVE CONTAINERS (stops when terminal closes):
+  shell <project>             Open bash shell
+  run <project> <cmd...>      Run command (e.g., dsb run my-wallet droid)
+
+DETACHED CONTAINERS (keeps running in background):
+  start <project> [cmd]       Start container in background (default: bash)
+  stop <project>              Stop detached container
+  attach <project>            Attach to running container (Ctrl+P, Ctrl+Q to detach)
+  exec <project> <cmd...>     Run command in running container
+  logs <project> [-f]         View container logs
+
+STATUS & MAINTENANCE:
+  ps                          List running containers
+  status                      Show containers, images, and disk usage
+  build [--force]             Rebuild container image
+  clean                       Remove stopped containers
+
+SETUP:
+  setup                       First-time setup wizard
+  help [command]              Show help
+
+EXAMPLES:
+  dsb setup                           # First-time setup
+  dsb init my-wallet                  # Create project
+  dsb shell my-wallet                 # Interactive shell
+  dsb run my-wallet droid             # Run droid once
+  dsb start my-wallet                 # Start in background
+  dsb attach my-wallet                # Connect to background container
+  dsb stop my-wallet                  # Stop background container
+
+SECRETS:
+  - API key: ~/.config/dsb/api-key (mounted read-only in container)
+  - Project secrets: Create .env file in project folder (auto-loaded)
+
+For more info: https://github.com/YOUR_USERNAME/droid-sandbox
+EOF
+}
+
+# Main command router
+main() {
+    local command="${1:-help}"
+    shift 2>/dev/null || true
+    
+    case "$command" in
+        setup) cmd_setup "$@" ;;
+        init) cmd_init "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        clone) cmd_clone "$@" ;;
+        destroy|rm) cmd_destroy "$@" ;;
+        shell|sh) cmd_shell "$@" ;;
+        run) cmd_run "$@" ;;
+        start) cmd_start "$@" ;;
+        stop) cmd_stop "$@" ;;
+        attach) cmd_attach "$@" ;;
+        exec) cmd_exec "$@" ;;
+        logs) cmd_logs "$@" ;;
+        ps) cmd_ps "$@" ;;
+        status|info) cmd_status "$@" ;;
+        build) cmd_build "$@" ;;
+        clean) cmd_clean "$@" ;;
+        help|-h|--help) cmd_help "$@" ;;
+        version|-v|--version) echo "dsb version $VERSION" ;;
+        *) 
+            error "Unknown command: $command
+Try 'dsb help' for usage information"
+            ;;
+    esac
+}
+
+main "$@"
