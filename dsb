@@ -57,8 +57,16 @@ get_container_name() {
 }
 
 build_image() {
+    local version="$1"
     info "Building $IMAGE_NAME image..."
-    podman build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR"
+    
+    local build_args=()
+    if [ -n "$version" ]; then
+        info "Using Droid version: $version"
+        build_args+=("--build-arg" "DROID_VERSION=$version")
+    fi
+    
+    podman build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Containerfile" "${build_args[@]}" "$SCRIPT_DIR"
     success "Image built successfully"
 }
 
@@ -438,16 +446,44 @@ cmd_build() {
     check_podman
     
     local force=false
-    if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
-        force=true
-    fi
+    local version=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force|-f)
+                force=true
+                shift
+                ;;
+            --version|-v)
+                version="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
     
     if $force; then
         info "Force rebuilding image from scratch..."
         podman rmi "$IMAGE_NAME" 2>/dev/null || true
     fi
     
-    build_image
+    build_image "$version"
+}
+
+cmd_upgrade() {
+    local version="$1"
+    check_podman
+    
+    info "Removing old image to ensure upgrade..."
+    podman rmi "$IMAGE_NAME" 2>/dev/null || true
+    
+    if [ -n "$version" ]; then
+        build_image "$version"
+    else
+        build_image
+    fi
 }
 
 cmd_clean() {
@@ -522,6 +558,7 @@ STATUS & MAINTENANCE:
   ps                          List running containers
   status                      Show containers, images, and disk usage
   build [--force]             Rebuild container image
+  upgrade [version]           Upgrade to latest or specific version
   clean                       Remove stopped containers
 
 SETUP:
@@ -566,6 +603,7 @@ main() {
         ps) cmd_ps "$@" ;;
         status|info) cmd_status "$@" ;;
         build) cmd_build "$@" ;;
+        upgrade) cmd_upgrade "$@" ;;
         clean) cmd_clean "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
         version|-v|--version) echo "dsb version $VERSION" ;;

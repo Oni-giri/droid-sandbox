@@ -33,9 +33,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g typescript ts-node @types/node
 
 # Install Droid CLI (Factory.ai) globally
-RUN curl -fsSL https://app.factory.ai/cli | sh \
+ARG DROID_VERSION
+RUN curl -fsSL https://app.factory.ai/cli > /tmp/install_droid.sh \
+    && if [ -n "$DROID_VERSION" ]; then \
+        sed -i "s/VER=\".*\"/VER=\"$DROID_VERSION\"/" /tmp/install_droid.sh; \
+    fi \
+    && sh /tmp/install_droid.sh \
     && mv /root/.local/bin/droid /usr/local/bin/droid \
-    && chmod +x /usr/local/bin/droid
+    && chmod +x /usr/local/bin/droid \
+    && rm /tmp/install_droid.sh
 
 # Set up a non-root user for development
 ARG USERNAME=dev
