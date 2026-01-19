@@ -2,3 +2,5 @@
 *
 # But track this .gitignore file
 !.gitignore
+
+/webscrapper

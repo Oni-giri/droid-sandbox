@@ -3,3 +3,7 @@ projects/*
 
 # Keep the projects directory structure
 !projects/.gitkeep
+node_modules/
+package-lock.json
+package.json
+temp/

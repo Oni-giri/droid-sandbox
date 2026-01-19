@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     build-essential \
     xdg-utils \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python 3 and pip
@@ -30,7 +31,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Install common global npm packages for TypeScript development
-RUN npm install -g typescript ts-node @types/node
+RUN npm install -g typescript ts-node @types/node @anthropic-ai/claude-code
 
 # Install Droid CLI (Factory.ai) globally
 ARG DROID_VERSION
